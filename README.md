@@ -7,6 +7,8 @@ Modulo Go `github.com/karavy/api-engine` per eseguire chiamate API **GET, PUT, P
 - [go.mod](go.mod): definizione del modulo.
 - [pkg/apiengine/client.go](pkg/apiengine/client.go): package pubblico del client HTTP.
 - [pkg/apiengine/retry.go](pkg/apiengine/retry.go): policy dei retry e backoff.
+- [pkg/apiengine/schema.go](pkg/apiengine/schema.go): conversione della risposta in JSON strutturato, guidata da uno schema.
+- [pkg/apiengine/schema_test.go](pkg/apiengine/schema_test.go): test di schema, formati e validazione.
 - [pkg/apiengine/client_test.go](pkg/apiengine/client_test.go): test unitari, mantenuti accanto al codice secondo le convenzioni Go.
 - [pkg/apiengine/retry_test.go](pkg/apiengine/retry_test.go): test di retry, idempotenza, cancellazione e concorrenza.
 - [pkg/apiengine/doc_test.go](pkg/apiengine/doc_test.go): esempio eseguibile dell'API pubblica.
@@ -74,6 +76,50 @@ Se il body è un `runtime.RawExtension`, passare `spec.Body.Raw`; se è un `json
 - Per default i redirect **non vengono seguiti**: l'operator riceve lo status 3xx. Un `Config.HTTPClient` personalizzato conserva la propria policy di redirect.
 - `Config.HTTPClient` consente transport personalizzati per TLS, certificati client, proxy e test. La configurazione viene copiata senza modificare il client originale; il transport è condiviso.
 - Il client è riutilizzabile tra goroutine; non modificare body, header o query della richiesta mentre una chiamata è in corso.
+
+## Risposta come JSON strutturato
+
+`Response.Structured(schema)` restituisce sempre un JSON con questa forma:
+
+```json
+{"status": 200, "success": true, "headers": {"Content-Type": ["text/xml"]}, "data": {"id": 42}}
+```
+
+- Con `schema == nil` il body deve essere JSON valido (viene incorporato in `data` così com'è) oppure vuoto (`data: null`). Qualsiasi altro body restituisce `ErrSchemaRequired`.
+- Con uno schema, `data` è un oggetto con i campi dichiarati. Il body originale in `Response.Body` non viene modificato.
+
+Il modulo non sa da dove arrivi lo schema: chi lo usa lo recupera dalla propria fonte di configurazione (file, ConfigMap, CRD...) e passa il JSON a `ParseSchema`, che lo valida e precompila le regex.
+
+```go
+schema, err := apiengine.ParseSchema(raw) // raw []byte JSON
+if err != nil {
+    return err // schema non valido: errore subito, non alla prima risposta
+}
+out, err := response.Structured(schema)
+```
+
+```json
+{
+  "format": "xml",
+  "fields": [
+    {"name": "id", "path": "order/@id", "type": "int", "required": true},
+    {"name": "status", "path": "order/status"},
+    {"name": "items", "path": "order/items/item", "type": "string[]"}
+  ]
+}
+```
+
+`type` è `string` (default), `int`, `float` o `bool`, con suffisso `[]` per una lista. Un campo opzionale assente vale `null`; un campo `required` assente o un valore non convertibile restituisce `ErrSchemaMismatch` con il nome del campo. `ErrInvalidSchema` segnala schemi non validi (formato sconosciuto, nomi duplicati, regex errata, chiavi sconosciute, più di 100 campi).
+
+| `format` | significato di `path` |
+| --- | --- |
+| `xml` | percorso tra elementi dalla radice (`order/status`), `@nome` finale per un attributo; il valore di un elemento è il suo testo diretto, senza spazi ai bordi. Niente predicati né namespace |
+| `form` | nome della chiave (`application/x-www-form-urlencoded`) |
+| `csv` | nome della colonna nell'header o indice (da 0). Un campo scalare legge la prima riga, una lista tutta la colonna |
+| `lines` | indice di riga (da 0) oppure prefisso (`Status:`), con il resto della riga senza spazi ai bordi |
+| `text` | regex RE2 con **esattamente un** gruppo di cattura; scalare = primo match, lista = tutti |
+
+HTML non è supportato (nessun parser nella libreria standard): usare `text` con una regex. Non chiamare `Structured` su una risposta parziale, cioè quando `Do` ha restituito un errore. Lo schema è un input non fidato se proviene da configurazione esterna: i limiti su campi, lunghezza dei path e profondità XML sono applicati dalla validazione.
 
 ## Retry e budget temporale
 
